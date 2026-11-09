@@ -1,0 +1,5 @@
+{
+  "name": "show-figure",
+  "owner": { "name": "ranoot" },
+  "plugins": [{ "name": "show-figure", "source": "./" }]
+}
