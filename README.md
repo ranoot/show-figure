@@ -2,7 +2,7 @@
 
 A Claude Code mod that lets Claude draw figures straight into your terminal.
 
-It registers a `ShowFigure` tool. Claude passes it SVG or Mermaid source; the mod renders it to PNG and shows it in a docked **Figure** pane beside the chat. In the desktop app (and VS Code / mobile) the SVG is drawn natively instead. The pane keeps the last 30 figures; page through them with ◀ ▶ (`p` / `n` while the pane has focus). `/figure` reopens the pane and tells you if the terminal can't draw images.
+It registers a `ShowFigure` tool. Claude passes it SVG or Mermaid source; the mod renders it to PNG and draws it inline in the transcript, right under the tool call (up to 20 rows tall). In the desktop app (and VS Code / mobile) the SVG is drawn natively instead. Every figure is also kept in a **Figure** pane (the last 30; page with ◀ ▶, or `p` / `n` while the pane has focus): `/figure` opens it and tells you if the terminal can't draw images, and it opens by itself when a figure can't be drawn inline.
 
 Use it for anything you can express as SVG: diagrams, geometry, plots, memory layouts, UI sketches, illustrations — or Mermaid for quick flowcharts, sequence/state/class/ER diagrams, gantt charts and mind maps.
 

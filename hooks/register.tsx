@@ -268,15 +268,72 @@ async function showFigure($: EngineInterface, input: Input) {
   }
   await update($, figures, list => [...list, figure].slice(-KEEP))
   await update($, cursor, () => -1)
-  const opened = await $.ui.open({ id: PANE, title: 'Figure' })
 
-  const where = opened.isPlaced
-    ? 'It is now showing in the Figure pane.'
-    : `The Figure pane is open but not drawn yet (${opened.reason}); the user can show it with /figure.`
-
+  // The inline drawing reads the two paths back out of this text, so keep
+  // "PNG at <path>" and "SVG at <path>" in it.
   return {
-    result: `${where} Rendered ${kind} → ${pxWidth}×${pxHeight}px PNG at ${pngPath} (SVG at ${svgPath}). Read the PNG to check it if needed.`,
+    result: `Shown to the user inline under this call (also in the Figure pane, /figure). Rendered ${kind} → ${pxWidth}×${pxHeight}px PNG at ${pngPath} (SVG at ${svgPath}). Read the PNG to check it if needed.`,
   }
+}
+
+// ---- Inline drawing under the tool call --------------------------------
+
+const INLINE_MAX_ROWS = 20
+// The transcript indents a tool result; leave room for it.
+const INLINE_INDENT = 6
+
+type Png = { base64: string; width: number; height: number }
+// Keyed by file path: a figure's files never change once written.
+const pngCache = new Map<string, Png>()
+const svgCache = new Map<string, string>()
+// Tool calls whose inline drawing fell back to the pane already.
+const paneFallbacks = new Set<string>()
+
+function pathsFrom(output: unknown): { pngPath?: string; svgPath?: string } {
+  const text = typeof output === 'string' ? output : JSON.stringify(output ?? '')
+  return {
+    pngPath: /PNG at (\S+?\.png)\b/.exec(text)?.[1],
+    svgPath: /SVG at (\S+?\.svg)\b/.exec(text)?.[1],
+  }
+}
+
+async function loadPng($: EngineInterface, path: string): Promise<Png> {
+  const hit = pngCache.get(path)
+  if (hit !== undefined) return hit
+  const { base64 } = await $.fs.read(path, { as: 'bytes' })
+  const png = { base64, ...pngSize(base64) }
+  pngCache.set(path, png)
+
+  return png
+}
+
+async function loadSvg($: EngineInterface, path: string): Promise<string> {
+  const hit = svgCache.get(path)
+  if (hit !== undefined) return hit
+  const svg = await $.fs.read(path)
+  svgCache.set(path, svg)
+
+  return svg
+}
+
+/** Opens the pane once per call whose figure could not be drawn inline. */
+function fallBackToPane($: EngineInterface, toolUseId: string) {
+  if (paneFallbacks.has(toolUseId)) return
+  paneFallbacks.add(toolUseId)
+  void $.ui.open({ id: PANE, title: 'Figure' }).catch(() => undefined)
+}
+
+/** Cells for a picture: as wide as the transcript, at most 20 rows tall. */
+function fitCells(pxWidth: number, pxHeight: number, columns: number) {
+  const ratio = pxHeight / Math.max(1, pxWidth)
+  let cols = Math.max(10, Math.min(255, columns - INLINE_INDENT))
+  let rows = Math.max(1, Math.round((cols * ratio) / CELL_ASPECT))
+  if (rows > INLINE_MAX_ROWS) {
+    rows = INLINE_MAX_ROWS
+    cols = Math.max(1, Math.min(cols, Math.round((rows * CELL_ASPECT) / ratio)))
+  }
+
+  return { cols, rows }
 }
 
 export const register: Register = on => {
@@ -297,6 +354,81 @@ export const register: Register = on => {
 
   on('tool.call', { tool: FULL_TOOL }, async ($, e) => {
     return showFigure($, e as unknown as Input)
+  })
+
+  // The call's row: show the title rather than pages of SVG source.
+  on('ui.render', { component: 'ToolUse', props: { tool: 'mcp__show-figure__ShowFigure' } }, async ($, e, next) => {
+    if (e.props.isExpanded === true) return next(e)
+    const input = (e.props.input ?? {}) as Partial<Input>
+    const source = typeof input.source === 'string' ? input.source.trim() : ''
+    const format = input.format ?? (source.startsWith('<') ? 'svg' : 'mermaid')
+    const shown: Record<string, string> = { title: input.title?.trim() || 'Figure', format }
+
+    return next({ ...e, props: { ...e.props, input: shown } })
+  })
+
+  // The result under the call: the figure itself.
+  on(
+    'ui.render',
+    { component: 'ToolResult', props: { tool: 'mcp__show-figure__ShowFigure' } },
+    async ($, e, next) => {
+      if (e.props.isErrored || e.props.isExpanded === true) return next(e)
+      const { pngPath, svgPath } = pathsFrom(e.props.output)
+      if (pngPath === undefined) return next(e)
+      const list = await read($, figures)
+      const figure = list.find(f => f.pngPath === pngPath)
+      const title = figure?.title ?? 'Figure'
+      const alt = figure?.alt ?? title
+      const columns = e.viewport?.columns ?? 80
+
+      if (e.surface === 'terminal') {
+        const els = $.ui.resolve(e)
+        const { Box, Text } = els
+        if (!('Image' in els) || els.Image === undefined) {
+          fallBackToPane($, e.props.tool_use_id)
+          return <Text dimColor>{`▣ ${title}: shown in the Figure pane (/figure)`}</Text>
+        }
+        const { Image } = els
+        const png = await loadPng($, pngPath)
+        const { cols, rows } = fitCells(png.width, png.height, columns)
+        const source =
+          (png.base64.length * 3) / 4 <= MAX_INLINE_PNG
+            ? { png: png.base64 }
+            : { file: pngPath, format: 'png' as const }
+
+        return (
+          <Box flexDirection="column">
+            <Image key={`fig-${e.props.tool_use_id}`} source={source} columns={cols} rows={rows} alt={`▣ ${title}: ${alt}`} />
+            <Text dimColor>{`${title} · /figure opens it in the pane`}</Text>
+          </Box>
+        )
+      }
+
+      const els = $.ui.resolve(e)
+      const { Box, Text } = els
+      const svg = svgPath === undefined ? undefined : await loadSvg($, svgPath)
+      if (!('Svg' in els) || els.Svg === undefined || svg === undefined || svg.length > MAX_SVG_CHARS) {
+        fallBackToPane($, e.props.tool_use_id)
+        return <Text dimColor>{`▣ ${title}: shown in the Figure pane (/figure)`}</Text>
+      }
+      const { Svg } = els
+      const ratio = figure !== undefined ? figure.pxHeight / Math.max(1, figure.pxWidth) : 0.5625
+      // About 8 CSS px per cell across, 18 down: fit the width, cap the height.
+      const width = Math.round(Math.min((columns - INLINE_INDENT) * 8, (INLINE_MAX_ROWS * 18) / ratio))
+
+      return (
+        <Box flexDirection="column">
+          <Svg source={svg} alt={alt} width={width} />
+          <Text dimColor>{title}</Text>
+        </Box>
+      )
+    },
+  ).catch(($, e) => {
+    // A drawing the surface refuses: one caption line, and the pane instead.
+    fallBackToPane($, e.props.tool_use_id)
+    const { Text } = $.ui.resolve(e)
+
+    return <Text dimColor>▣ Figure: could not be drawn inline; shown in the Figure pane (/figure)</Text>
   })
 
   on('command.run', { command: 'figure' }, async $ => {

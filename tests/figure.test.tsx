@@ -60,6 +60,57 @@ test('ShowFigure renders an SVG and every surface draws it', async ($, on) => {
   }
 })
 
+test('the figure draws inline under the call: Image on the terminal, Svg elsewhere', async ($, on) => {
+  const written: Record<string, string> = {}
+  on('tool.register', () => ({ value: { tool: 'mcp__show-figure__ShowFigure' } }))
+  on('command.register', () => ({ value: { command: 'figure' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/t' : undefined }))
+  on('fs.write', (_, e) => {
+    written[e.path] = e.text
+    return { value: undefined }
+  })
+  on('fs.exists', () => ({ value: false }))
+  on('fs.read', (_, e) =>
+    e.as === 'bytes' ? { value: { base64: PNG_HEAD } } : { value: written[e.path] ?? SVG },
+  )
+  on('process.run', (_, e) => ({
+    value: {
+      exitCode: 0,
+      stdout: e.argv[0] === 'which' ? `/bin/${e.argv[1]}\n` : '',
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const answer = await $.tool.call({ tool: 'mcp__show-figure__ShowFigure', source: SVG, title: 'Inline' })
+  const output = String(answer.result)
+  expect(output).toMatch(/PNG at \/home\/t\/\.cache\/show-figure\/\S+\.png/)
+
+  const RESULT = {
+    plugin: 'show-figure',
+    component: 'ToolResult',
+    requestId: 'tu-1',
+    viewport: { columns: 100, rows: 40 },
+    props: { tool_use_id: 'tu-1', tool: 'mcp__show-figure__ShowFigure', output, isErrored: false },
+  } as const
+
+  const term = await $.ui.mount({ ...RESULT, surface: 'terminal' })
+  const image = await term.find({ type: 'Image' })
+  expect(image).toBeTruthy()
+  expect((await term.find({ type: 'Text', text: /Inline/ }))?.text).toMatch(/Inline/)
+  await term.unmount()
+
+  for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({ ...RESULT, surface })
+    expect(await ui.find({ type: 'Svg' })).toBeTruthy()
+    await ui.unmount()
+  }
+})
+
 test('an empty source is refused', async ($, on) => {
   on('tool.register', () => ({ value: { tool: 'mcp__show-figure__ShowFigure' } }))
   on('command.register', () => ({ value: { command: 'figure' } }))
