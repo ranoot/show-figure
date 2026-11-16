@@ -2,7 +2,7 @@ export type Figure = {
   id: string
   title: string
   alt: string
-  kind: 'svg' | 'mermaid'
+  kind: 'svg' | 'mermaid' | 'logic'
   svgPath: string
   pngPath: string
   pxWidth: number
