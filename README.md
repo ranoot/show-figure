@@ -28,7 +28,8 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 
 - **SVG → PNG:** [`resvg`](https://github.com/linebender/resvg) (`cargo install resvg`) or `rsvg-convert` (`sudo apt install librsvg2-bin` / `brew install librsvg`).
 - **Mermaid (optional):** `mmdc` from `npm i -g @mermaid-js/mermaid-cli`. The mod points it at an installed Chrome/Chromium if it finds one, so you can install with `PUPPETEER_SKIP_DOWNLOAD=1`.
-- **A terminal that draws images:** kitty or Ghostty (kitty graphics protocol), or iTerm2 3.5+ with fullscreen rendering. Elsewhere the pane shows the figure's description and PNG path.
+- **A terminal that draws images:** kitty or Ghostty (kitty graphics protocol), or iTerm2 3.5+ with fullscreen rendering. Elsewhere the figure is drawn as coloured half-block text cells (see below), or, failing that, as its description and PNG path.
+- **Background sessions:** a background job draws into a virtual terminal that passes text but not images, so there figures are drawn as coloured half-block cells (`▀`, two pixels per cell, up to 40 rows inline). Shapes, plots and colours read; small text does not. This needs `ffmpeg` or `python3` with Pillow. Run Claude Code in the foreground for full-resolution figures.
 - **Inside tmux:** turn on passthrough (and keep `focus-events` on), then restart Claude Code:
 
   ```
