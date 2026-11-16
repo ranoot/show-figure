@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ImageSource, Register } from 'claude-code'
 
 import type { Figure } from '../types'
+import { LogicError, PATCH_MARK, logicToSvg, parseLibrary, serializeLibrary, splitChunks } from './logic/render.js'
 
 const PLUGIN = 'show-figure'
 const TOOL = 'ShowFigure'
@@ -28,6 +29,16 @@ const DESCRIPTION = [
   'or Mermaid source (flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, gantt, mindmap, ...).',
   '`format` is detected from the source when omitted (starts with "<" → svg).',
   '',
+  'Logic circuits / datapaths: format "logic". Write the netlist; the tool lays out, routes and verifies it (never overlaps):',
+  '  input A B Instr[32] · Y = and(A, !B) "label" · output Y Cout   (# comments)',
+  '  gates and or nand nor xor xnor not buf (2-8 inputs; !X draws a bubble) · mux(A, B, S=sel) · alu(A, B, op=c) → .Result .Zero',
+  '  adder(A, B) → .Sum · dff(D=d, CLK=clk) jkff tff srlatch → .Q .Qn · reg(D=d, CLK=clk, EN=e) → .Q · numbers (4) are constants',
+  '  block RegFile "Registers" { left: RR1[5] WD[32]; right: RD1[32] RD2[32]; top: RegWrite }  then  RF = RegFile(RR1=Instr[25:21], WD=WB)',
+  '    sides left/right/top/bottom (right = outputs; `top out:` etc. otherwise); ~Pin = control (blue), ^Pin = clock; blocks are remembered across calls',
+  '  one-off: IM = box "Instruction\\nmemory" { left: Addr[32]=PC; right: Instr[32] } · later: RF.WD = WB · refs X, X.Pin, X.Pin[15:0]',
+  '  arrange: place A above|below|left-of|right-of|same-row B · order col 2: A B · move A up|down|left|right [n] · col A 3 · spacing 1.5 · show names · remove A',
+  'The result maps the columns (top to bottom) and gives an id: to adjust, call again with base: "<id>" and only the new lines; no need to Read the PNG.',
+  '',
   'SVG tips: always set a viewBox; use plain <text> (no <foreignObject>, no external images/fonts, no scripts);',
   'font-family sans-serif / serif / monospace; the default background is white, so draw in dark colors',
   'unless you pass another `background`. Aim for roughly 16:9 or wider so it fits a side pane.',
@@ -39,8 +50,9 @@ const DESCRIPTION = [
 const INPUT_SCHEMA = {
   type: 'object',
   properties: {
-    source: { type: 'string', description: 'A full SVG document, or Mermaid diagram source.' },
-    format: { type: 'string', enum: ['svg', 'mermaid'], description: 'Omit to auto-detect.' },
+    source: { type: 'string', description: 'A full SVG document, Mermaid source, or a logic netlist (with base: only the new lines).' },
+    format: { type: 'string', enum: ['svg', 'mermaid', 'logic'], description: 'Omit to auto-detect.' },
+    base: { type: 'string', description: 'logic only: id of an earlier logic figure; source is applied on top of it.' },
     title: { type: 'string', description: 'Short title shown above the figure.' },
     alt: { type: 'string', description: 'One-sentence description, shown where images cannot be drawn.' },
     background: { type: 'string', description: 'Background color, default "white". "transparent" for none.' },
@@ -56,7 +68,8 @@ const INPUT_SCHEMA = {
 
 type Input = {
   source: string
-  format?: 'svg' | 'mermaid'
+  format?: 'svg' | 'mermaid' | 'logic'
+  base?: string
   title?: string
   alt?: string
   background?: string
@@ -214,6 +227,44 @@ async function svgToPng(
   )
 }
 
+function detectFormat(input: Partial<Input>, source: string): Figure['kind'] {
+  if (input.format !== undefined) return input.format
+  if (input.base !== undefined) return 'logic'
+  if (source.startsWith('<')) return 'svg'
+  const first = source.split('\n').find(l => l.trim() !== '' && !l.trim().startsWith('#'))?.trim() ?? ''
+  return /^(input|inputs|block|title)\b/.test(first) ? 'logic' : 'mermaid'
+}
+
+type LogicOut = { svgPath: string; title?: string; width: number; text: string }
+
+async function logicFigure($: EngineInterface, dir: string, id: string, input: Input, source: string): Promise<LogicOut> {
+  let saved = source
+  let chunks = [source]
+  if (input.base !== undefined && input.base.trim() !== '') {
+    const base = input.base.trim()
+    if (!/^[a-z0-9-]+$/i.test(base)) throw new LogicError(`base '${base}' is not a figure id`)
+    const basePath = `${dir}/${base}.logic`
+    if (!(await $.fs.exists(basePath))) throw new LogicError(`no logic figure with id '${base}' (ids are in earlier ShowFigure results)`)
+    const prev = await $.fs.read(basePath)
+    chunks = [...splitChunks(prev), source]
+    saved = `${prev.trimEnd()}\n${PATCH_MARK}\n${source}\n`
+  }
+  const libPath = `${dir}/blocks.logic`
+  const libText = (await $.fs.exists(libPath)) ? await $.fs.read(libPath) : undefined
+  const library = parseLibrary(libText)
+  const r = logicToSvg(chunks, library)
+  const svgPath = `${dir}/${id}.svg`
+  await $.fs.write(svgPath, r.svg)
+  await $.fs.write(`${dir}/${id}.logic`, saved)
+  if (r.blocks.length > 0) {
+    for (const b of r.blocks) library.set(b.name, b)
+    await $.fs.write(libPath, serializeLibrary(library))
+  }
+  const width = input.width ?? Math.min(2400, Math.max(800, r.width * 2))
+
+  return { svgPath, title: r.title, width, text: `id ${id} · ${r.map}` }
+}
+
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 
 /** Width and height from a base64 PNG's IHDR chunk (bytes 16-23). */
@@ -231,16 +282,21 @@ function pngSize(base64: string): { width: number; height: number } {
 async function showFigure($: EngineInterface, input: Input) {
   const source = typeof input.source === 'string' ? input.source.trim() : ''
   if (source === '') return { deny: '`source` is required: an SVG document or Mermaid source.' }
-  const kind: Figure['kind'] = input.format ?? (source.startsWith('<') ? 'svg' : 'mermaid')
+  const kind = detectFormat(input, source)
   const background = input.background?.trim() || 'white'
-  const width = Math.round(Math.min(3000, Math.max(200, input.width ?? 1600)))
+  let width = Math.round(Math.min(3000, Math.max(200, input.width ?? 1600)))
   const dir = await cacheDir($)
   const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   const pngPath = `${dir}/${id}.png`
 
   let svgPath: string
+  let logic: LogicOut | undefined
   try {
-    if (kind === 'svg') {
+    if (kind === 'logic') {
+      logic = await logicFigure($, dir, id, input, source)
+      svgPath = logic.svgPath
+      width = Math.round(Math.min(3000, Math.max(200, logic.width)))
+    } else if (kind === 'svg') {
       if (!/<svg[\s>]/i.test(source)) return { deny: 'format is svg but the source holds no <svg> element.' }
       svgPath = `${dir}/${id}.svg`
       await $.fs.write(svgPath, source)
@@ -249,12 +305,13 @@ async function showFigure($: EngineInterface, input: Input) {
     }
     await svgToPng($, svgPath, pngPath, width, background)
   } catch (err) {
+    if (err instanceof LogicError) return { deny: `logic: ${err.message}` }
     return { deny: err instanceof Error ? err.message : String(err) }
   }
 
   const { base64 } = await $.fs.read(pngPath, { as: 'bytes' })
   const { width: pxWidth, height: pxHeight } = pngSize(base64)
-  const title = input.title?.trim() || (kind === 'mermaid' ? 'Diagram' : 'Figure')
+  const title = input.title?.trim() || logic?.title || (kind === 'mermaid' ? 'Diagram' : kind === 'logic' ? 'Circuit' : 'Figure')
   const figure: Figure = {
     id,
     title,
@@ -271,9 +328,10 @@ async function showFigure($: EngineInterface, input: Input) {
 
   // The inline drawing reads the two paths back out of this text, so keep
   // "PNG at <path>" and "SVG at <path>" in it.
-  return {
-    result: `Shown to the user inline under this call (also in the Figure pane, /figure). Rendered ${kind} → ${pxWidth}×${pxHeight}px PNG at ${pngPath} (SVG at ${svgPath}). Read the PNG to check it if needed.`,
-  }
+  const shown = `Shown to the user inline under this call (also in the Figure pane, /figure). Rendered ${kind} → ${pxWidth}×${pxHeight}px PNG at ${pngPath} (SVG at ${svgPath}).`
+  if (logic !== undefined) return { result: `${shown}\n${logic.text}` }
+
+  return { result: `${shown} Read the PNG to check it if needed.` }
 }
 
 // ---- How the terminal draws a figure -----------------------------------
@@ -519,8 +577,9 @@ export const register: Register = on => {
     if (e.props.isExpanded === true) return next(e)
     const input = (e.props.input ?? {}) as Partial<Input>
     const source = typeof input.source === 'string' ? input.source.trim() : ''
-    const format = input.format ?? (source.startsWith('<') ? 'svg' : 'mermaid')
+    const format = detectFormat(input, source)
     const shown: Record<string, string> = { title: input.title?.trim() || 'Figure', format }
+    if (input.base !== undefined) shown.base = input.base
 
     return next({ ...e, props: { ...e.props, input: shown } })
   })
