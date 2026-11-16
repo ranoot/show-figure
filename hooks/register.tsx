@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, ImageSource, Register } from 'claude-code'
 
 import type { Figure } from '../types'
 
@@ -276,9 +276,167 @@ async function showFigure($: EngineInterface, input: Input) {
   }
 }
 
+// ---- How the terminal draws a figure -----------------------------------
+//
+// A foreground session draws real pixels with `Image` (kitty / Ghostty /
+// iTerm2). A background session (`claude` jobs) draws into a virtual terminal
+// the daemon owns, which relays text cells to the attached client but not
+// image escape sequences, so there the figure is drawn as half-block cells
+// (`▀`: the foreground colours the top pixel, the background the bottom one)
+// in a `Raster`. Where neither can be drawn, the figure's description and PNG
+// path stand in, so a site is never left blank.
+
+const HALF_BLOCK = 0x2580
+const DEFAULT_COLOR = 0x01000000
+const PIL_SCRIPT = [
+  'import sys',
+  'from PIL import Image',
+  'src, w, h, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]',
+  "im = Image.open(src).convert('RGBA').resize((w, h), Image.BOX)",
+  "open(out, 'wb').write(im.tobytes())",
+].join('\n')
+
+const B64_INDEX = new Map([...B64].map((ch, i) => [ch, i]))
+
+function fromBase64(text: string): Uint8Array {
+  const clean = text.replace(/[^A-Za-z0-9+/]/g, '')
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4))
+  const at = (i: number) => B64_INDEX.get(clean[i] ?? 'A') ?? 0
+  let o = 0
+  for (let i = 0; i < clean.length; i += 4) {
+    const n = (at(i) << 18) | (at(i + 1) << 12) | (at(i + 2) << 6) | at(i + 3)
+    for (const shift of [16, 8, 0]) {
+      if (o < out.length) out[o++] = (n >> shift) & 255
+    }
+  }
+
+  return out
+}
+
+function toBase64(bytes: Uint8Array): string {
+  const out: string[] = []
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = ((bytes[i] ?? 0) << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0)
+    out.push(
+      B64[(n >> 18) & 63] ?? 'A',
+      B64[(n >> 12) & 63] ?? 'A',
+      i + 1 < bytes.length ? (B64[(n >> 6) & 63] ?? 'A') : '=',
+      i + 2 < bytes.length ? (B64[n & 63] ?? 'A') : '=',
+    )
+  }
+
+  return out.join('')
+}
+
+type Picture =
+  | { kind: 'image'; source: ImageSource }
+  | { kind: 'raster'; cells: string }
+  | { kind: 'text'; reason: string }
+
+let isBackground: boolean | undefined
+const cellsCache = new Map<string, string>()
+
+/** Whether this session is a background job, which cannot pass images through. */
+async function inBackground($: EngineInterface): Promise<boolean> {
+  if (isBackground !== undefined) return isBackground
+  const kind = await $.env.get('CLAUDE_CODE_SESSION_KIND')
+  const backend = await $.env.get('CLAUDE_BG_BACKEND')
+  isBackground = kind === 'bg' || (backend !== undefined && backend !== '')
+
+  return isBackground
+}
+
+/** The PNG scaled to `width`×`height` RGBA pixels, by ffmpeg or else Pillow. */
+async function rgbaPixels($: EngineInterface, pngPath: string, width: number, height: number): Promise<Uint8Array> {
+  const rawPath = pngPath.replace(/\.png$/, `.${width}x${height}.rgba`)
+  const expected = width * height * 4
+  const readRaw = async () => {
+    if (!(await $.fs.exists(rawPath))) return undefined
+    const bytes = fromBase64((await $.fs.read(rawPath, { as: 'bytes' })).base64)
+    return bytes.length === expected ? bytes : undefined
+  }
+  const cached = await readRaw()
+  if (cached !== undefined) return cached
+
+  const ffmpeg = await findBinary($, 'ffmpeg')
+  if (ffmpeg !== null) {
+    const r = await $.process.run(
+      [ffmpeg, '-v', 'error', '-y', '-i', pngPath, '-vf', `scale=${width}:${height}:flags=area`,
+        '-f', 'rawvideo', '-pix_fmt', 'rgba', rawPath],
+      { timeoutMs: 30000 },
+    )
+    const bytes = r.exitCode === 0 ? await readRaw() : undefined
+    if (bytes !== undefined) return bytes
+  }
+  const python = await findBinary($, 'python3')
+  if (python !== null) {
+    const r = await $.process.run([python, '-c', PIL_SCRIPT, pngPath, String(width), String(height), rawPath], {
+      timeoutMs: 30000,
+    })
+    const bytes = r.exitCode === 0 ? await readRaw() : undefined
+    if (bytes !== undefined) return bytes
+  }
+  throw new Error('drawing a figure as text cells needs ffmpeg, or python3 with Pillow')
+}
+
+/** Half-block cells for a `cols`×`rows` Raster: two pixels per cell. */
+async function figureCells($: EngineInterface, pngPath: string, cols: number, rows: number): Promise<string> {
+  const cacheKey = `${pngPath}@${cols}x${rows}`
+  const hit = cellsCache.get(cacheKey)
+  if (hit !== undefined) return hit
+  const px = await rgbaPixels($, pngPath, cols, rows * 2)
+  const color = (at: number) =>
+    (px[at + 3] ?? 0) < 128 ? DEFAULT_COLOR : ((px[at] ?? 0) << 16) | ((px[at + 1] ?? 0) << 8) | (px[at + 2] ?? 0)
+  const words = new Uint32Array(cols * rows * 3)
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = (r * cols + c) * 3
+      words[k] = HALF_BLOCK
+      words[k + 1] = color((2 * r * cols + c) * 4)
+      words[k + 2] = color(((2 * r + 1) * cols + c) * 4)
+    }
+  }
+  const cells = toBase64(new Uint8Array(words.buffer))
+  cellsCache.set(cacheKey, cells)
+
+  return cells
+}
+
+/**
+ * How to draw a figure in a box of `cols`×`rows` terminal cells, given the
+ * elements this terminal's table holds.
+ */
+async function terminalPicture(
+  $: EngineInterface,
+  els: object,
+  pngPath: string,
+  cols: number,
+  rows: number,
+  generation?: number,
+): Promise<Picture> {
+  const hasImage = 'Image' in els && els.Image !== undefined
+  const hasRaster = 'Raster' in els && els.Raster !== undefined
+  if (hasImage && !(await inBackground($))) {
+    const png = await loadPng($, pngPath)
+    const source: ImageSource =
+      (png.base64.length * 3) / 4 <= MAX_INLINE_PNG
+        ? { png: png.base64 }
+        : { file: pngPath, format: 'png', ...(generation !== undefined ? { generation } : {}) }
+    return { kind: 'image', source }
+  }
+  if (!hasRaster) return { kind: 'text', reason: 'this terminal draws neither images nor cell grids' }
+  try {
+    return { kind: 'raster', cells: await figureCells($, pngPath, cols, rows) }
+  } catch (err) {
+    return { kind: 'text', reason: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 // ---- Inline drawing under the tool call --------------------------------
 
 const INLINE_MAX_ROWS = 20
+// Half-block cells hold two pixels each, so a cell-drawn figure gets more rows.
+const INLINE_MAX_CELL_ROWS = 40
 // The transcript indents a tool result; leave room for it.
 const INLINE_INDENT = 6
 
@@ -324,12 +482,12 @@ function fallBackToPane($: EngineInterface, toolUseId: string) {
 }
 
 /** Cells for a picture: as wide as the transcript, at most 20 rows tall. */
-function fitCells(pxWidth: number, pxHeight: number, columns: number) {
+function fitCells(pxWidth: number, pxHeight: number, columns: number, maxRows = INLINE_MAX_ROWS) {
   const ratio = pxHeight / Math.max(1, pxWidth)
   let cols = Math.max(10, Math.min(255, columns - INLINE_INDENT))
   let rows = Math.max(1, Math.round((cols * ratio) / CELL_ASPECT))
-  if (rows > INLINE_MAX_ROWS) {
-    rows = INLINE_MAX_ROWS
+  if (rows > maxRows) {
+    rows = maxRows
     cols = Math.max(1, Math.min(cols, Math.round((rows * CELL_ASPECT) / ratio)))
   }
 
@@ -384,24 +542,38 @@ export const register: Register = on => {
       if (e.surface === 'terminal') {
         const els = $.ui.resolve(e)
         const { Box, Text } = els
-        if (!('Image' in els) || els.Image === undefined) {
-          fallBackToPane($, e.props.tool_use_id)
-          return <Text dimColor>{`▣ ${title}: shown in the Figure pane (/figure)`}</Text>
-        }
-        const { Image } = els
         const png = await loadPng($, pngPath)
-        const { cols, rows } = fitCells(png.width, png.height, columns)
-        const source =
-          (png.base64.length * 3) / 4 <= MAX_INLINE_PNG
-            ? { png: png.base64 }
-            : { file: pngPath, format: 'png' as const }
-
-        return (
-          <Box flexDirection="column">
-            <Image key={`fig-${e.props.tool_use_id}`} source={source} columns={cols} rows={rows} alt={`▣ ${title}: ${alt}`} />
-            <Text dimColor>{`${title} · /figure opens it in the pane`}</Text>
-          </Box>
+        const drawsPixels = 'Image' in els && els.Image !== undefined && !(await inBackground($))
+        const { cols, rows } = fitCells(
+          png.width,
+          png.height,
+          columns,
+          drawsPixels ? INLINE_MAX_ROWS : INLINE_MAX_CELL_ROWS,
         )
+        const picture = await terminalPicture($, els, pngPath, cols, rows)
+        const key = `fig-${e.props.tool_use_id}`
+        const caption = <Text dimColor>{`${title} · /figure opens it in the pane`}</Text>
+
+        if (picture.kind === 'image' && 'Image' in els && els.Image !== undefined) {
+          const { Image } = els
+          return (
+            <Box flexDirection="column">
+              <Image key={key} source={picture.source} columns={cols} rows={rows} alt={`▣ ${title}: ${alt}`} />
+              {caption}
+            </Box>
+          )
+        }
+        if (picture.kind === 'raster' && 'Raster' in els && els.Raster !== undefined) {
+          const { Raster } = els
+          return (
+            <Box flexDirection="column">
+              <Raster key={key} columns={cols} rows={rows} cells={picture.cells} />
+              {caption}
+            </Box>
+          )
+        }
+
+        return <Text dimColor>{`▣ ${title}: ${alt} (PNG at ${pngPath})`}</Text>
       }
 
       const els = $.ui.resolve(e)
@@ -436,13 +608,26 @@ export const register: Register = on => {
     const opened = await $.ui.open({ id: PANE, title: 'Figure' })
     if (list.length === 0) return { text: 'No figures yet. Ask Claude to draw something.' }
     if (!opened.isPlaced) return { text: `Figure pane waiting: ${opened.reason}` }
+    if (await inBackground($)) {
+      return {
+        text:
+          'Figure pane shown. This is a background session, which cannot pass images to your terminal, ' +
+          'so figures are drawn as coloured text cells; a foreground session draws them at full resolution.',
+      }
+    }
 
     // Re-send the shown picture: the engine says whether it can draw pixels here.
     const at = await read($, cursor)
     const figure = list[at < 0 || at >= list.length ? list.length - 1 : at]
     if (figure === undefined) return { text: 'Figure pane shown.' }
     const { base64 } = await $.fs.read(figure.pngPath, { as: 'bytes' })
-    const probe = await $.ui.blit({ requestId: PANE, key: 'figure', source: { png: base64 } })
+    const blit = () => $.ui.blit({ requestId: PANE, key: 'figure', source: { png: base64 } })
+    let probe = await blit()
+    if (probe.deny !== undefined && probe.fix === undefined) {
+      // A pane opened just now may not have drawn its first frame yet.
+      await $.clock.sleep(300)
+      probe = await blit()
+    }
     if (probe.deny === undefined) return { text: 'Figure pane shown; the image is drawn.' }
     if (probe.fix === 'tmux-passthrough') {
       return {
@@ -467,7 +652,8 @@ export const register: Register = on => {
       update($, cursor, () => (to >= list.length - 1 ? -1 : Math.max(0, to)))
 
     if (e.surface === 'terminal') {
-      const { Box, Text, Button, Image } = $.ui.resolve(e)
+      const els = $.ui.resolve(e)
+      const { Box, Text, Button } = els
       if (figure === undefined) {
         return <Text dimColor>No figures yet. Claude draws here with ShowFigure.</Text>
       }
@@ -482,11 +668,18 @@ export const register: Register = on => {
       }
       rows = Math.min(255, rows)
 
-      const { base64 } = await $.fs.read(figure.pngPath, { as: 'bytes' })
-      const isInline = (base64.length * 3) / 4 <= MAX_INLINE_PNG
-      const source = isInline
-        ? { png: base64 }
-        : { file: figure.pngPath, format: 'png' as const, generation: figure.createdAt }
+      const picture = await terminalPicture($, els, figure.pngPath, cols, rows, figure.createdAt)
+      let body
+      if (picture.kind === 'image' && 'Image' in els && els.Image !== undefined) {
+        const { Image } = els
+        body = <Image key="figure" source={picture.source} columns={cols} rows={rows} alt={figure.alt} />
+      } else if (picture.kind === 'raster' && 'Raster' in els && els.Raster !== undefined) {
+        const { Raster } = els
+        body = <Raster key="figure" columns={cols} rows={rows} cells={picture.cells} />
+      } else {
+        const reason = picture.kind === 'text' ? picture.reason : 'this terminal cannot draw it'
+        body = <Text dimColor>{`${figure.alt} (not drawn here: ${reason})`}</Text>
+      }
 
       return (
         <Box flexDirection="column">
@@ -510,7 +703,7 @@ export const register: Register = on => {
               </Box>
             )}
           </Box>
-          <Image key="figure" source={source} columns={cols} rows={rows} alt={figure.alt} />
+          {body}
           <Text dimColor wrap="truncate-start">
             {figure.pngPath}
           </Text>
@@ -548,5 +741,10 @@ export const register: Register = on => {
         )}
       </Box>
     )
+  }).catch(($, e) => {
+    // Never leave the pane blank: one line saying where the figure is.
+    const { Text } = $.ui.resolve(e)
+
+    return <Text dimColor>The figure could not be drawn here; its PNG is in ~/.cache/show-figure.</Text>
   })
 }
