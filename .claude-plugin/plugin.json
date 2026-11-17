@@ -1,6 +1,6 @@
 {
   "name": "show-figure",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "ShowFigure tool: render SVG, Mermaid or logic circuits (laid out and routed, never overlapping) and show it in a docked pane (PNG in the terminal, native SVG on desktop)",
   "types": "./types/index.d.ts"
 }

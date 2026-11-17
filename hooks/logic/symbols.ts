@@ -11,6 +11,8 @@ export const MUTED = '#57606a'
 /** Pin pitch. */
 export const P = 24
 
+const FLIP_FLOPS = new Set(['dff', 'tff', 'jkff', 'srlatch'])
+
 export type SymPin = { name: string; side: Side; x: number; y: number }
 export type Sym = { w: number; h: number; pins: Map<string, SymPin>; svg: (ox: number, oy: number) => string }
 
@@ -24,7 +26,11 @@ function text(x: number, y: number, s: string, size: number, anchor: 'start' | '
   return `<text x="${n2(x)}" y="${n2(y)}" font-size="${size}" text-anchor="${anchor}" fill="${color}"${extra}>${esc(s)}</text>`
 }
 
-const stroke = (w = 2, color = INK) => `fill="none" stroke="${color}" stroke-width="${w}" stroke-linejoin="round" stroke-linecap="round"`
+// Sharp corners throughout: mitred joins, butt ends. Bodies are filled white; strokes and stubs are not.
+const stroke = (w = 2, color = INK) => `fill="none" stroke="${color}" stroke-width="${w}"`
+const body = (w = 2) => `fill="white" stroke="${INK}" stroke-width="${w}"`
+/** Wire stubs inside a symbol, the same weight as the wires outside it. */
+const WIRE = 1.8
 
 export function symbolFor(node: GNode, showNames: boolean): Sym {
   switch (node.shape) {
@@ -37,69 +43,77 @@ export function symbolFor(node: GNode, showNames: boolean): Sym {
     case 'alu':
     case 'adder':
       return trapezoidSym(node)
+    case 'rect':
+      if (FLIP_FLOPS.has(node.type)) return ffSym(node)
+      return rectSym(node)
     default:
       return rectSym(node)
   }
 }
 
+/**
+ * Gates in textbook proportions: an AND body is a straight run then a true semicircle, about
+ * 1.2 times as wide as it is tall; OR and XOR are 1.3 times. Wider gates grow taller, not longer.
+ */
 function gateSym(node: GNode, withLabel: boolean): Sym {
   const ins = node.pins.filter(p => p.dir === 'in')
   const n = ins.length
   const bodyH = Math.max(2, n) * P
-  const h = bodyH + (withLabel ? 14 : 0)
-  const w = 70
+  const h = bodyH + (withLabel ? 16 : 0)
   const type = node.type
+  const isNot = type === 'not' || type === 'buf'
   const bubbleOut = type === 'nand' || type === 'nor' || type === 'xnor' || type === 'not'
-  const pinY = (k: number) => (n === 1 ? bodyH / 2 : P / 2 + k * P)
-  const pins = new Map<string, SymPin>()
-  ins.forEach((p, k) => pins.set(p.name, { name: p.name, side: 'left', x: 0, y: pinY(k) }))
-  pins.set('out', { name: 'out', side: 'right', x: w, y: bodyH / 2 })
-
   const isOr = type === 'or' || type === 'nor' || type === 'xor' || type === 'xnor'
   const isXor = type === 'xor' || type === 'xnor'
-  // x of the body's input edge at height y (OR family has a curved back).
+  const extra = Math.max(0, n - 2)
+  const B = 10 // input stub
+  const X0 = B + (isXor ? 8 : 0) // where the body's back starts
+  const tri = 32
+  const bw = isNot ? tri : isOr ? 62 + 6 * extra : 34 + 24 + 4 * extra
+  const backDepth = isOr ? 0.35 * Math.min(bodyH, 64) : 0
+  const tip = X0 + bw
+  const w = tip + (bubbleOut ? 8 : 0) + 10
+  const mid = bodyH / 2
+  const pinY = (k: number) => (n === 1 ? mid : P / 2 + k * P)
+  const pins = new Map<string, SymPin>()
+  ins.forEach((p, k) => pins.set(p.name, { name: p.name, side: 'left', x: 0, y: pinY(k) }))
+  pins.set('out', { name: 'out', side: 'right', x: w, y: mid })
+  // x of the input edge at height y: the back curve for OR, the outer curve for XOR.
   const backX = (y: number) => {
-    if (type === 'not' || type === 'buf') return 12
-    if (!isOr) return 10
+    if (isNot) return X0
+    if (!isOr) return X0
     const t = y / bodyH
-    return 10 + 2 * t * (1 - t) * 12
+    return B + 2 * t * (1 - t) * backDepth
   }
 
   const svg = (ox: number, oy: number) => {
     const X = (v: number) => n2(ox + v)
     const Y = (v: number) => n2(oy + v)
     const parts: string[] = []
-    const mid = bodyH / 2
-    if (type === 'not' || type === 'buf') {
-      parts.push(`<path d="M${X(12)},${Y(mid - 15)} L${X(52)},${Y(mid)} L${X(12)},${Y(mid + 15)} Z" ${stroke()}/>`)
-    } else if (isOr) {
-      parts.push(
-        `<path d="M${X(10)},${Y(0)} Q${X(45)},${Y(0)} ${X(60)},${Y(mid)} Q${X(45)},${Y(bodyH)} ${X(10)},${Y(bodyH)} Q${X(22)},${Y(mid)} ${X(10)},${Y(0)} Z" ${stroke()}/>`,
-      )
-      if (isXor) parts.push(`<path d="M${X(3)},${Y(0)} Q${X(15)},${Y(mid)} ${X(3)},${Y(bodyH)}" ${stroke()}/>`)
-    } else {
-      parts.push(
-        `<path d="M${X(10)},${Y(0)} H${X(35)} A25,${n2(mid)} 0 0 1 ${X(35)},${Y(bodyH)} H${X(10)} Z" ${stroke()}/>`,
-      )
-    }
-    const tip = type === 'not' || type === 'buf' ? 52 : 60
-    if (bubbleOut) {
-      parts.push(`<circle cx="${X(tip + 4)}" cy="${Y(mid)}" r="4" ${stroke(2)}/>`)
-      parts.push(`<path d="M${X(tip + 8)},${Y(mid)} H${X(w)}" ${stroke(2)}/>`)
-    } else {
-      parts.push(`<path d="M${X(tip)},${Y(mid)} H${X(w)}" ${stroke(2)}/>`)
-    }
     ins.forEach((p, k) => {
       const y = pinY(k)
       const edge = backX(y)
-      if (p.invert) {
-        parts.push(`<circle cx="${X(edge - 4)}" cy="${Y(y)}" r="4" ${stroke(2)}/>`)
-        if (edge - 8 > 0) parts.push(`<path d="M${X(0)},${Y(y)} H${X(edge - 8)}" ${stroke(2)}/>`)
-      } else {
-        parts.push(`<path d="M${X(0)},${Y(y)} H${X(edge)}" ${stroke(2)}/>`)
-      }
+      const end = p.invert ? edge - 8 : edge
+      if (end > 0) parts.push(`<path d="M${X(0)},${Y(y)} H${X(end + 1)}" ${stroke(WIRE)}/>`)
     })
-    if (withLabel) parts.push(text(ox + 35, oy + bodyH + 11, node.label, 10, 'middle', MUTED))
+    parts.push(`<path d="M${X(tip)},${Y(mid)} H${X(w)}" ${stroke(WIRE)}/>`)
+    if (isNot) {
+      parts.push(`<path d="M${X(X0)},${Y(mid - 16)} L${X(tip)},${Y(mid)} L${X(X0)},${Y(mid + 16)} Z" ${body()}/>`)
+    } else if (isOr) {
+      const c = 0.65 * bw
+      parts.push(
+        `<path d="M${X(X0)},${Y(0)} Q${X(X0 + backDepth)},${Y(mid)} ${X(X0)},${Y(bodyH)} Q${X(X0 + c)},${Y(bodyH)} ${X(tip)},${Y(mid)} Q${X(X0 + c)},${Y(0)} ${X(X0)},${Y(0)} Z" ${body()}/>`,
+      )
+      if (isXor) parts.push(`<path d="M${X(B)},${Y(0)} Q${X(B + backDepth)},${Y(mid)} ${X(B)},${Y(bodyH)}" ${stroke()}/>`)
+    } else {
+      const rx = bw - 34
+      parts.push(`<path d="M${X(X0)},${Y(0)} H${X(tip - rx)} A${n2(rx)},${n2(mid)} 0 0 1 ${X(tip - rx)},${Y(bodyH)} H${X(X0)} Z" ${body()}/>`)
+    }
+    if (bubbleOut) parts.push(`<circle cx="${X(tip + 4)}" cy="${Y(mid)}" r="4" ${body()}/>`)
+    ins.forEach((p, k) => {
+      if (p.invert) parts.push(`<circle cx="${X(backX(pinY(k)) - 4)}" cy="${Y(pinY(k))}" r="4" ${body()}/>`)
+    })
+    if (withLabel) parts.push(text(ox + X0 + bw / 2, oy + bodyH + 13, node.label, 12, 'middle', MUTED, ' font-style="italic"'))
     return parts.join('')
   }
 
@@ -108,7 +122,7 @@ function gateSym(node: GNode, withLabel: boolean): Sym {
 
 function portSym(node: GNode): Sym {
   const isConst = node.kind === 'const'
-  const size = isConst ? 12 : 14
+  const size = isConst ? 13 : 15
   // Bold runs wider than the regular advance textWidth estimates.
   const tw = Math.ceil(textWidth(node.label, size) * (isConst ? 1 : 1.08))
   const w = tw + 20
@@ -119,28 +133,30 @@ function portSym(node: GNode): Sym {
   const svg = (ox: number, oy: number) => {
     const style = isConst ? ' font-style="italic"' : ' font-weight="600"'
     if (isOut) {
-      return `<path d="M${n2(ox)},${n2(oy + 10)} H${n2(ox + 12)}" ${stroke(2)}/>${text(ox + 18, oy + 15, node.label, size, 'start', INK, style)}`
+      return `<path d="M${n2(ox)},${n2(oy + 10)} H${n2(ox + 12)}" ${stroke(WIRE)}/>${text(ox + 18, oy + 15.5, node.label, size, 'start', INK, style)}`
     }
-    return `${text(ox + tw, oy + 15, node.label, size, 'end', INK, style)}<path d="M${n2(ox + tw + 8)},${n2(oy + 10)} H${n2(ox + w)}" ${stroke(2)}/>`
+    return `${text(ox + tw, oy + 15.5, node.label, size, 'end', INK, style)}<path d="M${n2(ox + tw + 8)},${n2(oy + 10)} H${n2(ox + w)}" ${stroke(WIRE)}/>`
   }
 
   return { w, h, pins, svg }
 }
 
-/** The mux trapezoid: data inputs on the long left edge with their select codes, select from below. */
+/** The mux trapezoid, 40 wide: inputs 24 apart on the long edge with their select codes, select from below. */
 function muxSym(node: GNode, withLabel: boolean): Sym {
   const data = node.pins.filter(p => p.name.startsWith('in'))
   const n = data.length
-  const bodyH = (n + 1) * P
+  const bodyH = 24 * n + 16
   const label = withLabel && node.label !== '' ? node.label : withLabel ? node.name : ''
   // The name goes above the body: the select wire leaves from the bottom.
-  const top = label ? 16 : 0
+  const top = label ? 20 : 0
   const h = bodyH + top
-  const codeW = Math.max(0, ...data.map(p => textWidth(p.label ?? '', 12)))
-  const w = Math.max(36, codeW + 26)
-  const slant = Math.min(P * 0.75, bodyH * 0.2)
+  const FS = n > 2 ? 11 : 12
+  const codeW = Math.max(0, ...data.map(p => textWidth(p.label ?? '', FS)))
+  const w = Math.max(40, codeW + 26)
+  const slant = 14
+  const pinY = (k: number) => 20 + 24 * k
   const pins = new Map<string, SymPin>()
-  data.forEach((p, k) => pins.set(p.name, { name: p.name, side: 'left', x: 0, y: top + P + k * P }))
+  data.forEach((p, k) => pins.set(p.name, { name: p.name, side: 'left', x: 0, y: top + pinY(k) }))
   pins.set('out', { name: 'out', side: 'right', x: w, y: top + bodyH / 2 })
   const sel = node.pins.find(p => p.name === 'S')
   if (sel) pins.set('S', { name: 'S', side: 'bottom', x: w / 2, y: h })
@@ -148,17 +164,57 @@ function muxSym(node: GNode, withLabel: boolean): Sym {
     const oy = y0 + top
     const X = (v: number) => n2(ox + v)
     const Y = (v: number) => n2(oy + v)
-    const parts = [`<path d="M${X(0)},${Y(0)} L${X(w)},${Y(slant)} L${X(w)},${Y(bodyH - slant)} L${X(0)},${Y(bodyH)} Z" ${stroke()}/>`]
-    if (sel) {
-      const ss = node.pins.find(p => p.name === 'S')!
-      parts.push(`<path d="M${X(w / 2)},${Y(bodyH - slant / 2)} V${Y(bodyH)}" ${stroke(2, ss.ctrl ? CTRL : INK)}/>`)
-    }
+    const parts: string[] = []
+    if (sel) parts.push(`<path d="M${X(w / 2)},${Y(bodyH - slant / 2)} V${Y(bodyH)}" ${stroke(WIRE, sel.ctrl ? CTRL : INK)}/>`)
+    parts.push(`<path d="M${X(0)},${Y(0)} L${X(w)},${Y(slant)} L${X(w)},${Y(bodyH - slant)} L${X(0)},${Y(bodyH)} Z" ${body()}/>`)
     data.forEach((p, k) => {
-      const y = P + k * P
-      parts.push(text(ox + (p.invert ? 10 : 6), oy + y + 4, p.label ?? String(k), 12, 'start'))
-      if (p.invert) parts.push(`<circle cx="${X(3)}" cy="${Y(y)}" r="3" ${stroke(1.6)}/>`)
+      const y = pinY(k)
+      parts.push(text(ox + (p.invert ? 12 : 7), oy + y + 4, p.label ?? String(k), FS, 'start'))
+      if (p.invert) parts.push(`<circle cx="${X(-4)}" cy="${Y(y)}" r="4" ${body()}/>`)
     })
-    if (label) parts.push(text(ox + w / 2, y0 + 11, label, 11, 'middle', MUTED))
+    if (label) parts.push(text(ox + w / 2, y0 + 12, label, 14, 'middle', INK, ' font-weight="600"'))
+    return parts.join('')
+  }
+
+  return { w, h, pins, svg }
+}
+
+/**
+ * Flip-flops and latches, 64 by 76 as in a textbook: D and Q on the top row, the clock low on the
+ * left, the instance name in bold above.
+ */
+function ffSym(node: GNode): Sym {
+  const left = node.pins.filter(p => p.side === 'left')
+  const right = node.pins.filter(p => p.side === 'right')
+  const others = node.pins.filter(p => p.side === 'top' || p.side === 'bottom')
+  const top = 22
+  const pitch = left.length === 2 ? 36 : 24
+  const rowY = (k: number) => 18 + k * pitch
+  const last = rowY(Math.max(left.length, 1) - 1)
+  const bodyH = Math.max(76, last + 22)
+  const w = 64
+  const h = top + bodyH
+  const pins = new Map<string, SymPin>()
+  left.forEach((p, k) => pins.set(p.name, { name: p.name, side: 'left', x: 0, y: top + rowY(k) }))
+  // Q on the first row; Q' on the last.
+  right.forEach((p, k) => pins.set(p.name, { name: p.name, side: 'right', x: w, y: top + (k === 0 ? rowY(0) : last) }))
+  for (const p of others) pins.set(p.name, { name: p.name, side: p.side, x: w / 2, y: p.side === 'top' ? top : h })
+  const svg = (ox: number, y0: number) => {
+    const oy = y0 + top
+    const X = (v: number) => n2(ox + v)
+    const Y = (v: number) => n2(oy + v)
+    const parts = [`<rect x="${X(0)}" y="${Y(0)}" width="${w}" height="${bodyH}" ${body()}/>`]
+    left.forEach((p, k) => {
+      const y = rowY(k)
+      if (p.clock) {
+        parts.push(`<path d="M${X(0)},${Y(y - 7)} L${X(10)},${Y(y)} L${X(0)},${Y(y + 7)}" ${stroke(WIRE)}/>`)
+        return
+      }
+      if (p.invert) parts.push(`<circle cx="${X(-4)}" cy="${Y(y)}" r="4" ${body()}/>`)
+      parts.push(text(ox + 8, oy + y + 4.5, p.label ?? p.name, 13, 'start'))
+    })
+    right.forEach((p, k) => parts.push(text(ox + w - 8, oy + (k === 0 ? rowY(0) : last) + 4.5, p.label ?? p.name, 13, 'end')))
+    if (node.name) parts.push(text(ox + w / 2, y0 + 14, node.name, 14, 'middle', INK, ' font-weight="600"'))
     return parts.join('')
   }
 
@@ -201,7 +257,7 @@ function trapezoidSym(node: GNode): Sym {
     const X = (v: number) => n2(ox + v)
     const Y = (v: number) => n2(oy + v)
     const parts = [
-      `<path d="M${X(0)},${Y(0)} L${X(w)},${Y(slant)} L${X(w)},${Y(h - slant)} L${X(0)},${Y(h)} L${X(0)},${Y(mid + notch)} L${X(w * 0.2)},${Y(mid)} L${X(0)},${Y(mid - notch)} Z" ${stroke()}/>`,
+      `<path d="M${X(0)},${Y(0)} L${X(w)},${Y(slant)} L${X(w)},${Y(h - slant)} L${X(0)},${Y(h)} L${X(0)},${Y(mid + notch)} L${X(w * 0.2)},${Y(mid)} L${X(0)},${Y(mid - notch)} Z" ${body()}/>`,
     ]
     for (const p of top) {
       const sp = pins.get(p.name)!
@@ -276,7 +332,7 @@ function rectSym(node: GNode): Sym {
   )
 
   const svg = (ox: number, oy: number) => {
-    const parts = [`<rect x="${n2(ox)}" y="${n2(oy)}" width="${w}" height="${h}" rx="2" ${stroke()}/>`]
+    const parts = [`<rect x="${n2(ox)}" y="${n2(oy)}" width="${w}" height="${h}" ${body()}/>`]
     for (const p of node.pins) {
       const sp = pins.get(p.name)
       if (sp === undefined) continue
@@ -291,7 +347,7 @@ function rectSym(node: GNode): Sym {
           at += 12
         }
         // The bubble sits just outside the edge, over the end of the wire.
-        if (p.invert) parts.push(`<circle cx="${n2(x - 4)}" cy="${n2(y)}" r="4" fill="white" stroke="${INK}" stroke-width="2"/>`)
+        if (p.invert) parts.push(`<circle cx="${n2(x - 4)}" cy="${n2(y)}" r="4" ${body()}/>`)
         if (name) parts.push(text(at, y + 4, name, FS, 'start', color))
       } else if (sp.side === 'right') {
         if (name) parts.push(text(x - 4, y + 3.5, name, FS, 'end', color))

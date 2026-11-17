@@ -95,7 +95,7 @@ function toSvg(geo: Geometry): { svg: string; width: number; height: number } {
       .join('')
   const plain = wires(false)
   const ctrl = wires(true)
-  if (plain) parts.push(`<path d="${plain}" fill="none" stroke="${INK}" stroke-width="2" stroke-linecap="square"/>`)
+  if (plain) parts.push(`<path d="${plain}" fill="none" stroke="${INK}" stroke-width="1.8" stroke-linecap="square"/>`)
   if (ctrl) parts.push(`<path d="${ctrl}" fill="none" stroke="${CTRL}" stroke-width="1.6" stroke-linecap="square"/>`)
   for (const d of geo.dots) {
     parts.push(`<circle cx="${n2(d.x)}" cy="${n2(d.y)}" r="3.5" fill="${ctrlNet(d.net) ? CTRL : INK}"/>`)
