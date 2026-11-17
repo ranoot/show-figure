@@ -9,7 +9,9 @@ import type { GNode, Graph, Net } from './graph.js'
 import { P, symbolFor } from './symbols.js'
 import type { Sym } from './symbols.js'
 
-const TRACK = 10
+const TRACK = 12
+/** Every item sits so its pins land on this grid; then two pins either line up or differ by a real step. */
+const GRID = P / 2
 const MINSEP = 5
 const DUMMY_H = 10
 const EPS = 0.01
@@ -221,7 +223,12 @@ type Ctx = {
   rowPin: Map<Item, number>
   shift: Map<Item, number>
   aligns: [Item, Item][]
+  /** Inputs that only feed selects and enables (1) or clocks (2): drawn under the data inputs, clocks last. */
+  low: Map<Item, number>
+  lowNets: Map<string, number>
   nudge: Map<Item, number>
+  /** Where on the grid an item's top goes, so its first pin lands on a grid line. */
+  phase: Map<Item, number>
 }
 
 function build(g: Graph, spacing: number, warnings: string[], newest: number): Ctx {
@@ -247,7 +254,7 @@ function build(g: Graph, spacing: number, warnings: string[], newest: number): C
       const outs = ps.filter(p => p.dir === 'out').sort((a, b) => sym.pins.get(b.name)!.x - sym.pins.get(a.name)!.x)
       ;[...ins, ...outs].forEach((p, k) => map.set(p.name, k))
     }
-    const margin = (n: number) => (n > 0 ? n * TRACK + 6 : 0)
+    const margin = (n: number) => (n > 0 ? n * TRACK + GRID : 0)
     const topM = margin(topTrack.size)
     const botM = margin(botTrack.size)
     const item: Item = {
@@ -331,6 +338,31 @@ function build(g: Graph, spacing: number, warnings: string[], newest: number): C
       push({ item: dummy, net: net.id, channel: c - 1, side: 'R', dy: DUMMY_H / 2 })
       push({ item: dummy, net: net.id, channel: c, side: 'L', dy: DUMMY_H / 2 })
     }
+  }
+
+  const low = new Map<Item, number>()
+  const lowNets = new Map<string, number>()
+  for (const net of g.nets) {
+    const d = byNode.get(net.driver.node)!
+    if (d.node?.kind !== 'input' || net.sinks.length === 0) continue
+    const clock = (s: { node: string; pin: string }) =>
+      byNode.get(s.node)!.node!.pins.find(p => p.name === s.pin)?.clock === true
+    const control = (s: { node: string; pin: string }) => {
+      const it = byNode.get(s.node)!
+      const side = it.sym!.pins.get(s.pin)?.side
+      return clock(s) || side === 'bottom' || side === 'top'
+    }
+    if (net.sinks.every(clock)) low.set(d, 2)
+    else if (net.sinks.every(control)) low.set(d, 1)
+    if (low.has(d)) lowNets.set(net.id, low.get(d)!)
+  }
+  for (const it of items) {
+    if (it.net !== undefined && lowNets.has(it.net)) low.set(it, lowNets.get(it.net)!)
+  }
+
+  const phase = new Map<Item, number>()
+  for (const a of accesses) {
+    if (!phase.has(a.item)) phase.set(a.item, (((-a.dy) % GRID) + GRID) % GRID)
   }
 
   // Neighbours: the other end of the same net across the same channel.
@@ -420,12 +452,17 @@ function build(g: Graph, spacing: number, warnings: string[], newest: number): C
     shift,
     aligns,
     nudge: new Map(),
+    phase,
+    low,
+    lowNets,
   }
 }
 
 function gapBetween(ctx: Ctx, a: Item, b: Item): number {
-  if (a.node === undefined || b.node === undefined) return Math.round(6 * ctx.spacing)
-  return Math.round(18 * ctx.spacing)
+  // Ports stack at pin pitch, so a gate's inputs can come straight in from a column of them.
+  if (a.node?.shape === 'port' && b.node?.shape === 'port') return Math.round((P - 20) * ctx.spacing)
+  if (a.node === undefined || b.node === undefined) return Math.round(10 * ctx.spacing)
+  return Math.round(30 * ctx.spacing)
 }
 
 /** Least-squares positions for a column in a fixed order, no two bands closer than their gap. */
@@ -455,12 +492,33 @@ function legalize(ctx: Ctx, col: Item[], desired: number[]) {
     const base = Math.round(cl.sum / cl.n)
     for (let j = cl.first; j <= cl.last; j++) col[j]!.y = base + off[j]!
   }
+  // Onto the grid, top down, never closer than the gap.
+  for (let j = 0; j < col.length; j++) {
+    const it = col[j]!
+    const ph = ctx.phase.get(it) ?? 0
+    let y = Math.round((it.y - ph) / GRID) * GRID + ph
+    const prev = col[j - 1]
+    if (prev !== undefined) {
+      const floor = prev.y + prev.h + gapBetween(ctx, prev, it)
+      if (y < floor - EPS) y = Math.ceil((floor - ph) / GRID - 1e-9) * GRID + ph
+    }
+    it.y = y
+  }
 }
 
 function desiredOf(ctx: Ctx, it: Item, mode: 'L' | 'R' | 'both'): number | undefined {
+  // Clock, select and enable inputs run along the bottom and rise into their pins.
+  if (ctx.low.has(it)) {
+    let bottom = 0
+    for (const o of ctx.items) if (!ctx.low.has(o) && o.node?.kind !== 'input') bottom = Math.max(bottom, o.y + o.h)
+    return bottom + 2 * GRID + (ctx.nudge.get(it) ?? 0)
+  }
   let s = 0
   let w = 0
   for (const nb of ctx.neighbors.get(it) ?? []) {
+    // Those bottom inputs follow the rest; they never pull it down after them.
+    if (ctx.lowNets.has(nb.mine.net) && !ctx.lowNets.has(nb.other.net)) continue
+    if (ctx.lowNets.has(nb.mine.net) && it.node !== undefined) continue
     const oc = nb.other.item.col
     if (mode === 'L' && oc >= it.col) continue
     if (mode === 'R' && oc <= it.col) continue
@@ -489,6 +547,7 @@ function stackNaive(ctx: Ctx, col: Item[]) {
 function reorder(ctx: Ctx, c: number, keyed: { it: Item; key: number }[]): Item[] {
   keyed.sort((a, b) => a.key - b.key)
   let order = keyed.map(k => k.it)
+  order = [0, 1, 2].flatMap(rank => order.filter(it => (ctx.low.get(it) ?? 0) === rank))
   // Explicit rows and moves, then the precedence constraints, which win.
   for (const [it, row] of ctx.rowPin) {
     if (it.col !== c) continue
@@ -558,6 +617,57 @@ function positionOnly(ctx: Ctx) {
   for (const col of ctx.columns) stackNaive(ctx, col)
   for (const mode of ['L', 'R', 'L', 'both', 'both', 'both'] as const) sweep(ctx, mode, false)
   straighten(ctx)
+  dejog(ctx)
+}
+
+/** How far an item can move in its column without coming closer to its neighbours than their gap. */
+function roomOf(ctx: Ctx, it: Item): [number, number] {
+  const col = ctx.columns[it.col]!
+  const i = col.indexOf(it)
+  const prev = col[i - 1]
+  const next = col[i + 1]
+  const lo = prev ? prev.y + prev.h + gapBetween(ctx, prev, it) : -Infinity
+  const hi = next ? next.y - gapBetween(ctx, it, next) - it.h : Infinity
+  return [lo, hi]
+}
+
+/**
+ * Small steps between a pin and the wire it meets read as mistakes. Move each node, within the room
+ * its column leaves, to the height that lines up the most of its connections. Every move strictly
+ * adds aligned pairs, so this ends.
+ */
+function dejog(ctx: Ctx) {
+  const aligned = (it: Item, y: number) => {
+    let n = 0
+    for (const nb of ctx.neighbors.get(it) ?? []) {
+      if (Math.abs(y + nb.mine.dy - absY(nb.other)) < 0.5) n++
+    }
+    return n
+  }
+  for (let pass = 0; pass < 6; pass++) {
+    let moved = false
+    for (const it of ctx.items) {
+      if (ctx.nudge.has(it)) continue
+      const [lo, hi] = roomOf(ctx, it)
+      const here = aligned(it, it.y)
+      let best = here
+      let bestY = it.y
+      for (const nb of ctx.neighbors.get(it) ?? []) {
+        const y = absY(nb.other) - nb.mine.dy
+        if (y < lo - EPS || y > hi + EPS) continue
+        const n = aligned(it, y)
+        if (n > best || (n === best && n > here && Math.abs(y - it.y) < Math.abs(bestY - it.y))) {
+          best = n
+          bestY = y
+        }
+      }
+      if (best > here) {
+        it.y = bestY
+        moved = true
+      }
+    }
+    if (!moved) break
+  }
 }
 
 /** Long wires: move each net's lanes onto one height wherever their columns leave room, so they don't step. */
@@ -569,15 +679,7 @@ function straighten(ctx: Ctx) {
     l.push(it)
     chains.set(it.net, l)
   }
-  const room = (it: Item): [number, number] => {
-    const col = ctx.columns[it.col]!
-    const i = col.indexOf(it)
-    const prev = col[i - 1]
-    const next = col[i + 1]
-    const lo = prev ? prev.y + prev.h + gapBetween(ctx, prev, it) : -Infinity
-    const hi = next ? next.y - gapBetween(ctx, it, next) - it.h : Infinity
-    return [lo, hi]
-  }
+  const room = (it: Item) => roomOf(ctx, it)
   const sorted = [...chains.entries()].sort((a, b) => b[1].length - a[1].length)
   for (let pass = 0; pass < 2; pass++) {
     for (const [net, chain] of sorted) {
@@ -754,8 +856,8 @@ function route(ctx: Ctx): Routed {
   // Room for bus-width marks (near the driver) and bit-slice labels (near the reader).
   const pads = new Map<number, { l: number; r: number }>()
   for (const [k, list] of perChan) {
-    let l = 12
-    let r = 12
+    let l = 16
+    let r = 16
     for (const a of list) {
       const net = nets.get(a.net)!
       const isDriver = a.item.node !== undefined && net.driver.node === a.item.node.id && net.driver.pin === a.pin
@@ -780,10 +882,11 @@ function route(ctx: Ctx): Routed {
   const chanW = new Map<number, number>()
   for (let k = -1; k < C; k++) {
     const r = routed.get(k)
-    const pad = pads.get(k) ?? { l: 12, r: 12 }
+    const pad = pads.get(k) ?? { l: 16, r: 16 }
     const used = r !== undefined && r.nets.length > 0
     const inner = r !== undefined && r.tracks > 0 ? (r.tracks - 1) * TRACK : 0
-    const min = k === -1 || k === C - 1 ? (used ? 24 : 0) : Math.round(36 * ctx.spacing)
+    // Air between columns: parts read as separate things, joined by visible wires.
+    const min = k === -1 || k === C - 1 ? (used ? 40 : 0) : Math.round(64 * ctx.spacing)
     chanW.set(k, Math.max(min, used ? pad.l + inner + pad.r : 0))
   }
   const colX: number[] = []
@@ -829,13 +932,15 @@ function route(ctx: Ctx): Routed {
   for (const [k, r] of routed) {
     const left = chanX.get(k)!
     const right = left + chanW.get(k)!
-    const pad = pads.get(k) ?? { l: 12, r: 12 }
+    const pad = pads.get(k) ?? { l: 16, r: 16 }
     for (const cn of r.nets) {
       if (cn.straight) {
         seg(left, cn.ymin, right, cn.ymin, cn.net)
         continue
       }
-      const tx = left + pad.l + cn.track * TRACK
+      // Tracks sit in the middle of a channel wider than they need, not hugging the left column.
+      const slack = chanW.get(k)! - (pad.l + Math.max(0, r.tracks - 1) * TRACK + pad.r)
+      const tx = left + pad.l + Math.max(0, Math.round(slack / 2)) + cn.track * TRACK
       for (const a of cn.ls) seg(left, absY(a), tx, absY(a), cn.net)
       for (const a of cn.rs) seg(tx, absY(a), right, absY(a), cn.net)
       seg(tx, cn.ymin, tx, cn.ymax, cn.net)

@@ -124,6 +124,9 @@ const BUILTINS: Record<string, { shape: BlockShape; label: (name: string) => str
 }
 BUILTINS.add = BUILTINS.adder!
 
+/** Built-ins that are storage, not datapath blocks. */
+const STORAGE = new Set(['dff', 'tff', 'jkff', 'srlatch', 'reg'])
+
 /** Output pins whose width follows the widest data input of the same node. */
 const PASS_WIDTH: Record<string, [string, string[]]> = {
   alu: ['Result', ['A', 'B']],
@@ -182,7 +185,10 @@ export function resolve(program: Program, library: Map<string, BlockDef>, newest
       const data = inst.args.filter(a => a.pin === undefined)
       const named = inst.args.filter(a => a.pin !== undefined)
       if (data.length < 2 || data.length > 8) throw new LogicError(`${where_}: mux takes 2 to 8 data inputs, got ${data.length}`)
-      const pins: GPin[] = data.map((a, k) => ({ ...pin(`in${k}`, 'left', 'in', { label: String(k) }), invert: a.ref.invert }))
+      // Select codes in binary, as wide as the select: 0 1 for a 2:1 mux, 00 01 10 11 for a 4:1.
+      const bits = Math.max(1, Math.ceil(Math.log2(data.length)))
+      const code = (k: number) => (bits === 1 ? String(k) : k.toString(2).padStart(bits, '0'))
+      const pins: GPin[] = data.map((a, k) => ({ ...pin(`in${k}`, 'left', 'in', { label: code(k) }), invert: a.ref.invert }))
       let hasSel = false
       for (const a of named) {
         if (!/^(s|sel|S|Sel|SEL)$/.test(a.pin!)) throw new LogicError(`${where_}: mux has data inputs (positional) and S=select, not '${a.pin}'`)
@@ -364,6 +370,13 @@ export function resolve(program: Program, library: Map<string, BlockDef>, newest
   for (const net of nets.values()) {
     const dp = pinOf(net.driver.node, net.driver.pin)
     net.ctrl = (dp?.ctrl ?? false) || (net.sinks.length > 0 && net.sinks.every(s => pinOf(s.node, s.pin)?.ctrl === true))
+  }
+
+  // Blue control wires are a datapath convention; in a gate-level figure a select or enable is just a wire.
+  const datapath = nodes.some(n => n.shape === 'alu' || n.shape === 'adder' || (n.shape === 'rect' && !STORAGE.has(n.type)))
+  if (!datapath) {
+    for (const net of nets.values()) net.ctrl = false
+    for (const n of nodes) for (const p of n.pins) p.ctrl = false
   }
 
   return {

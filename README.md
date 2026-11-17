@@ -29,7 +29,7 @@ output S Cout
   RF = RegFile(RR1=Instr[25:21], RR2=Instr[20:16], WR=WRmux, WD=WBmux, RegWrite=Ctl.RegWrite)
   ```
 
-  Pins on the right are outputs. `top out:` makes one elsewhere, `~Pin` marks a control pin (drawn in blue) and `^Pin` a clock. A one-off can be written inline as `box "Label" { left: …; right: … }`. Blocks are remembered across calls, in `blocks.logic` in the cache folder.
+  Pins on the right are outputs. `top out:` makes one elsewhere, `~Pin` marks a control pin (drawn in blue when the figure has datapath blocks; a gate-level figure keeps every wire black) and `^Pin` a clock. A one-off can be written inline as `box "Label" { left: …; right: … }`. Blocks are remembered across calls, in `blocks.logic` in the cache folder.
 - **Rearranging**, without coordinates: `place A above|below|left-of|right-of|same-row B`, `order col 2: A B`, `move A up|down|left|right [n]`, `col A 3`, `spacing 1.5`, `show names`, `remove A`.
 
 **Nothing overlaps.** Layout and routing are built to keep gates, wires and labels apart, and every figure is checked again before it is shown. If a check fails, the layout is repaired and tried again. A figure that still can't pass is refused, never drawn wrong. A directive that conflicts with another is dropped with a warning.
